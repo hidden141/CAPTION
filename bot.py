@@ -38,7 +38,7 @@ admin = filters.private & filters.user(ADMINS)
 # ---------------------------------------------------------------- storage
 class Store:
     def __init__(self):
-        self.data = {"channels": [], "texts": [], "mode": "line", "autoclean": True}
+        self.data = {"channels": [], "texts": [], "mode": "line", "autoclean": True, "peers": {}}
         self.col = None
 
     async def load(self):
@@ -298,23 +298,67 @@ async def cmd_mode(_, m):
     await m.reply(f"✅ Mode: <b>{a}</b>")
 
 
+async def remember_peer(chat_id):
+    """Persist channel access_hash so it survives restarts (session is in-memory)."""
+    try:
+        peer = await app.resolve_peer(chat_id)
+        h = getattr(peer, "access_hash", None)
+        if h is not None and store.data["peers"].get(str(chat_id)) != h:
+            store.data["peers"][str(chat_id)] = h
+            await store.save()
+    except Exception as e:
+        print(f"⚠️ remember_peer {chat_id}: {e}")
+
+
+async def restore_peers():
+    rows = [(int(cid), h, "channel", None, None) for cid, h in store.data.get("peers", {}).items()]
+    if rows:
+        await app.storage.update_peers(rows)
+
+
+async def add_channel(m, chat):
+    if chat.id in store.data["channels"]:
+        return await m.reply("⚠️ Channel pehle se added hai.")
+    store.data["channels"].append(chat.id)
+    await store.save()
+    await remember_peer(chat.id)
+    await m.reply(f"✅ Added: <b>{html.escape(chat.title or '')}</b> (<code>{chat.id}</code>)")
+
+
 @app.on_message(admin & filters.command("addchannel"))
 async def cmd_addchannel(_, m):
     a = arg(m).strip()
     if not a:
-        return await m.reply("Use: <code>/addchannel -1001234567890</code> ya <code>@username</code>")
+        return await m.reply(
+            "Use: <code>/addchannel -1001234567890</code> ya <code>@username</code>\n"
+            "Ya channel ka koi post yahan <b>forward</b> kar do."
+        )
     try:
         chat = await app.get_chat(int(a) if a.lstrip("-").isdigit() else a)
         member = await app.get_chat_member(chat.id, "me")
         if member.status != enums.ChatMemberStatus.ADMINISTRATOR:
             return await m.reply("❌ Bot is channel me admin nahi hai. Pehle admin banao.")
     except Exception as e:
-        return await m.reply(f"❌ Channel nahi mila / bot admin nahi: {html.escape(str(e))}")
-    if chat.id in store.data["channels"]:
-        return await m.reply("⚠️ Channel pehle se added hai.")
-    store.data["channels"].append(chat.id)
-    await store.save()
-    await m.reply(f"✅ Added: <b>{html.escape(chat.title or '')}</b> (<code>{chat.id}</code>)")
+        return await m.reply(
+            f"❌ Channel nahi mila / bot admin nahi: {html.escape(str(e))}\n\n"
+            "Fix: bot ko channel me admin banao, phir us channel ka <b>koi post yahan forward kar do</b> "
+            "(bot ko channel ki pehchaan wahin se milti hai)."
+        )
+    await add_channel(m, chat)
+
+
+@app.on_message(admin & filters.forwarded)
+async def fwd_addchannel(_, m):
+    chat = m.forward_from_chat
+    if not chat or chat.type != enums.ChatType.CHANNEL:
+        return
+    try:
+        member = await app.get_chat_member(chat.id, "me")
+        if member.status != enums.ChatMemberStatus.ADMINISTRATOR:
+            return await m.reply("❌ Bot is channel me admin nahi hai. Pehle admin banao.")
+    except Exception as e:
+        return await m.reply(f"❌ Bot admin nahi / channel access nahi: {html.escape(str(e))}")
+    await add_channel(m, chat)
 
 
 @app.on_message(admin & filters.command("delchannel"))
@@ -416,6 +460,7 @@ async def health(_):
 async def main():
     await store.load()
     await app.start()
+    await restore_peers()
     web_app = web.Application()
     web_app.add_routes([web.get("/", health)])
     runner = web.AppRunner(web_app)
