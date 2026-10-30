@@ -4,6 +4,12 @@ import json
 import html
 import asyncio
 
+# Python 3.12+ no longer auto-creates an event loop; pyrogram needs one at import time.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from aiohttp import web
 from pyrogram import Client, filters, enums, idle
 from pyrogram.errors import FloodWait, MessageNotModified, MessageIdInvalid

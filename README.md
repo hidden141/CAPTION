@@ -7,7 +7,7 @@ Kya hatana hai wo admin bot ke andar commands se khud set karta hai.
 1. Ye saari files GitHub repo (private) me daalo.
 2. Render -> New + -> Web Service -> repo select.
 3. Build: `pip install -r requirements.txt` | Start: `python bot.py`
-4. Environment Variables: API_ID, API_HASH, BOT_TOKEN, ADMINS, MONGO_URI, PYTHON_VERSION=3.11.9
+4. Environment Variables: API_ID, API_HASH, BOT_TOKEN, ADMINS, MONGO_URI, PYTHON_VERSION=3.11.9 (ya repo me .python-version file, jo ab included hai)
 5. Bot ko channel me Admin banao (Post + Edit messages of others permission).
 6. Bot ko private me /start karo.
 
