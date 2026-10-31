@@ -40,7 +40,7 @@ admin = filters.private & filters.user(ADMINS)
 class Store:
     def __init__(self):
         self.data = {
-            "channels": [], "texts": [], "mode": "line", "autoclean": True,
+            "channels": [], "texts": [], "mode": "text", "autoclean": True,
             "backup": True, "peers": {},
         }
         self.col = None
@@ -182,6 +182,9 @@ def clean_html(h: str) -> str:
             p = build_pattern(t)
             if p:
                 res = p.sub("", res)
+        if res != h:  # shabd hatne se bani extra spaces saaf karo
+            res = re.sub(r"(?<=\S)[ \t]{2,}(?=\S)", " ", res)
+            res = re.sub(r"[ \t]+(?=\n|$)", "", res)
 
     res = re.sub(r"\n{3,}", "\n\n", res).strip()
     return res

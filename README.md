@@ -16,7 +16,7 @@ Kya hatana hai wo admin bot ke andar commands se khud set karta hai.
 /listtext            - saved texts dekho
 /deltext <no>        - number se text delete
 /cleartext           - saare texts delete
-/mode line|text      - line: jis line me text mile poori line hatao | text: sirf wahi text hatao
+/mode text|line      - text (default): sirf wahi shabd/text hatao, baaki line same | line: jis line me text mile poori line hatao
 /addchannel <id>     - channel add (-100xxxxxxxxxx ya @username)
 /delchannel <id>     - channel hatao
 /channels            - channels list
