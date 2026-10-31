@@ -21,6 +21,7 @@ ADMINS = [int(x) for x in os.environ.get("ADMINS", "").replace(" ", "").split(",
 MONGO_URI = os.environ.get("MONGO_URI", "")
 PORT = int(os.environ.get("PORT", 10000))
 DATA_FILE = "data.json"
+BACKUP_FILE = "backups.json"
 EDIT_DELAY = 1.2
 
 app = Client(
@@ -38,20 +39,94 @@ admin = filters.private & filters.user(ADMINS)
 # ---------------------------------------------------------------- storage
 class Store:
     def __init__(self):
-        self.data = {"channels": [], "texts": [], "mode": "line", "autoclean": True, "peers": {}}
+        self.data = {
+            "channels": [], "texts": [], "mode": "line", "autoclean": True,
+            "backup": True, "peers": {},
+        }
         self.col = None
+        self.bcol = None   # MongoDB collection for original-caption backups
+        self.bk = {}       # local-file backups: "chat:msgid" -> {chat, mid, kind, html}
 
     async def load(self):
         if MONGO_URI:
             from motor.motor_asyncio import AsyncIOMotorClient
-            self.col = AsyncIOMotorClient(MONGO_URI)["caption_cleaner"]["settings"]
+            db = AsyncIOMotorClient(MONGO_URI)["caption_cleaner"]
+            self.col = db["settings"]
+            self.bcol = db["backups"]
             doc = await self.col.find_one({"_id": "cfg"})
             if doc:
                 doc.pop("_id", None)
                 self.data.update(doc)
-        elif os.path.exists(DATA_FILE):
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                self.data.update(json.load(f))
+        else:
+            if os.path.exists(DATA_FILE):
+                with open(DATA_FILE, "r", encoding="utf-8") as f:
+                    self.data.update(json.load(f))
+            if os.path.exists(BACKUP_FILE):
+                with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+                    self.bk = json.load(f)
+
+    # ---- original caption/text backups (used by /restore) ----
+    async def bk_add(self, chat, mid, kind, html_text) -> bool:
+        """Save the ORIGINAL text of a post. Keeps the first one only. True if newly saved."""
+        key = f"{chat}:{mid}"
+        row = {"chat": chat, "mid": mid, "kind": kind, "html": html_text}
+        if self.bcol is not None:
+            r = await self.bcol.update_one({"_id": key}, {"$setOnInsert": row}, upsert=True)
+            return r.upserted_id is not None
+        if key in self.bk:
+            return False
+        self.bk[key] = row
+        return True
+
+    async def bk_del(self, chat, mid):
+        key = f"{chat}:{mid}"
+        if self.bcol is not None:
+            await self.bcol.delete_one({"_id": key})
+        else:
+            self.bk.pop(key, None)
+
+    async def bk_list(self, chat, start=1, end=None):
+        if self.bcol is not None:
+            q = {"chat": chat, "mid": {"$gte": start}}
+            if end is not None:
+                q["mid"]["$lte"] = end
+            return [d async for d in self.bcol.find(q).sort("mid", 1)]
+        rows = [r for r in self.bk.values()
+                if r["chat"] == chat and r["mid"] >= start and (end is None or r["mid"] <= end)]
+        return sorted(rows, key=lambda r: r["mid"])
+
+    async def bk_counts(self) -> dict:
+        if self.bcol is not None:
+            out = {}
+            async for d in self.bcol.aggregate([{"$group": {"_id": "$chat", "n": {"$sum": 1}}}]):
+                out[d["_id"]] = d["n"]
+            return out
+        out = {}
+        for r in self.bk.values():
+            out[r["chat"]] = out.get(r["chat"], 0) + 1
+        return out
+
+    async def bk_clear(self, chat=None) -> int:
+        if self.bcol is not None:
+            r = await self.bcol.delete_many({} if chat is None else {"chat": chat})
+            return r.deleted_count
+        keys = [k for k, r in self.bk.items() if chat is None or r["chat"] == chat]
+        for k in keys:
+            del self.bk[k]
+        self.bk_flush()
+        return len(keys)
+
+    def bk_flush(self):
+        """Local-file mode only: write backups to disk."""
+        if self.bcol is None:
+            with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.bk, f, ensure_ascii=False)
+
+    def bk_flush_safe(self):
+        try:
+            self.bk_flush()
+        except Exception as e:
+            print(f"⚠️ backup flush: {e}")
 
     async def save(self):
         if self.col is not None:
@@ -121,22 +196,74 @@ async def process(msg) -> bool:
         orig = msg.caption.html
         new = clean_html(orig)
         if new != orig.strip():
-            await app.edit_message_caption(
-                msg.chat.id, msg.id, new,
-                parse_mode=enums.ParseMode.HTML,
-                reply_markup=msg.reply_markup,
-            )
+            saved = await backup_original(msg, "caption", orig)
+            try:
+                await app.edit_message_caption(
+                    msg.chat.id, msg.id, new,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=msg.reply_markup,
+                )
+            except Exception:
+                if saved:
+                    await store.bk_del(msg.chat.id, msg.id)
+                raise
             return True
     elif msg.text:
         orig = msg.text.html
         new = clean_html(orig)
         if new != orig.strip() and new:
-            await app.edit_message_text(
-                msg.chat.id, msg.id, new,
-                parse_mode=enums.ParseMode.HTML,
-                reply_markup=msg.reply_markup,
-            )
+            saved = await backup_original(msg, "text", orig)
+            try:
+                await app.edit_message_text(
+                    msg.chat.id, msg.id, new,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=msg.reply_markup,
+                )
+            except Exception:
+                if saved:
+                    await store.bk_del(msg.chat.id, msg.id)
+                raise
             return True
+    return False
+
+
+async def backup_original(msg, kind, orig_html) -> bool:
+    """Save original text before editing so /restore can bring it back."""
+    if not store.data.get("backup", True):
+        return False
+    try:
+        return await store.bk_add(msg.chat.id, msg.id, kind, orig_html)
+    except Exception as e:
+        print(f"⚠️ backup {msg.chat.id}/{msg.id}: {e}")
+        return False
+
+
+async def restore_one(msg, row) -> bool:
+    """Put the original caption/text back. Returns True if restored (or already original)."""
+    for _ in range(3):
+        try:
+            if row["kind"] == "caption":
+                await app.edit_message_caption(
+                    msg.chat.id, msg.id, row["html"],
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=msg.reply_markup,
+                )
+            else:
+                await app.edit_message_text(
+                    msg.chat.id, msg.id, row["html"],
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=msg.reply_markup,
+                )
+            return True
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+        except MessageNotModified:
+            return True
+        except MessageIdInvalid:
+            return False
+        except Exception as e:
+            print(f"⚠️ restore {msg.chat.id}/{msg.id}: {e}")
+            return False
     return False
 
 
@@ -204,6 +331,71 @@ async def scan(chat_id: int, start: int, end, notify: int):
         await app.send_message(notify, f"❌ Error <code>{chat_id}</code>: {html.escape(str(e))}")
     finally:
         jobs.pop(chat_id, None)
+        store.bk_flush_safe()
+
+
+async def restore_scan(chat_id: int, start: int, end, notify: int):
+    """Bring back original captions/texts for posts that were cleaned earlier."""
+    job = jobs[chat_id] = {"stop": False}
+    done = failed = gone = 0
+    try:
+        rows = await store.bk_list(chat_id, start, end)
+        if not rows:
+            await app.send_message(
+                notify, f"ℹ️ <code>{chat_id}</code>: is range me koi backup nahi mila (restore karne layak kuch nahi)."
+            )
+            return
+        await app.send_message(
+            notify, f"♻️ Restore start: <code>{chat_id}</code>\nPosts: {len(rows)}"
+        )
+        for i in range(0, len(rows), 100):
+            if job["stop"]:
+                await app.send_message(notify, f"🛑 Restore stopped. Restored: {done}")
+                return
+            chunk = rows[i:i + 100]
+            ids = [r["mid"] for r in chunk]
+            msgs = None
+            for _ in range(3):
+                try:
+                    msgs = await app.get_messages(chat_id, ids)
+                    break
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 1)
+                except Exception as e:
+                    print(f"⚠️ restore get_messages {ids[0]}: {e}")
+                    break
+            if msgs is None:
+                failed += len(chunk)
+                continue
+            by_id = {m.id: m for m in msgs if m and not m.empty}
+            for r in chunk:
+                msg = by_id.get(r["mid"])
+                if msg is None:  # post delete ho chuka hai
+                    await store.bk_del(chat_id, r["mid"])
+                    gone += 1
+                    continue
+                if await restore_one(msg, r):
+                    await store.bk_del(chat_id, r["mid"])
+                    done += 1
+                    print(f"♻️ Restored {chat_id}/{r['mid']}")
+                    await asyncio.sleep(EDIT_DELAY)
+                else:
+                    failed += 1
+            if ((i // 100) + 1) % 10 == 0:
+                try:
+                    await app.send_message(notify, f"⏳ Restored {done}/{len(rows)}")
+                except Exception:
+                    pass
+        await app.send_message(
+            notify,
+            f"🏁 Restore done <code>{chat_id}</code>\nRestored: {done}\n"
+            f"Deleted posts (skip): {gone}\nFailed: {failed}",
+        )
+    except Exception as e:
+        await app.send_message(notify, f"❌ Restore error <code>{chat_id}</code>: {html.escape(str(e))}")
+    finally:
+        jobs.pop(chat_id, None)
+        store.bk_flush_safe()
 
 
 # ---------------------------------------------------------------- helpers
@@ -226,9 +418,14 @@ HELP = (
     "/channels\n\n"
     "<b>Clean</b>\n"
     "/clean [channel_id] [start_id] [end_id] - purane posts clean\n"
-    "/stop - cleaning roko\n"
+    "/stop - cleaning/restore roko\n"
     "/autoclean on|off - naye posts auto clean\n"
-    "/status - settings dekho"
+    "/status - settings dekho\n\n"
+    "<b>Repair (hataye hue caption wapas)</b>\n"
+    "/restore [channel_id] [start_id] [end_id] - original caption wapas lagao\n"
+    "/backup on|off - edit se pehle original save karna\n"
+    "/backups - kitne posts restore ho sakte hain\n"
+    "/clearbackup [channel_id] - backups delete karo"
 )
 
 
@@ -421,6 +618,66 @@ async def cmd_clean(_, m):
     await m.reply("▶️ Cleaning shuru. Progress yahin aayega. Rokne ke liye /stop")
 
 
+@app.on_message(admin & filters.command("restore"))
+async def cmd_restore(_, m):
+    args = m.command[1:]
+    if args and args[0].lstrip("-").isdigit() and len(args[0]) > 6:
+        targets = [int(args[0])]
+        args = args[1:]
+    else:
+        targets = list(store.data["channels"])
+    if not targets:
+        return await m.reply("❌ Koi channel nahi. /addchannel use karo ya <code>/restore -100xxxx</code>")
+
+    start = int(args[0]) if len(args) > 0 and args[0].isdigit() else 1
+    end = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+
+    async def runner():
+        for t in targets:
+            if t in jobs:
+                await m.reply(f"⚠️ <code>{t}</code> par kaam pehle se chal raha hai.")
+                continue
+            await restore_scan(t, start, end, m.chat.id)
+
+    asyncio.create_task(runner())
+    await m.reply(
+        "♻️ Restore shuru. Progress yahin aayega. Rokne ke liye /stop\n"
+        "⚠️ Restore ke baad /clean ya autoclean dubara text hata dega, "
+        "to zarurat ho to pehle /autoclean off karo."
+    )
+
+
+@app.on_message(admin & filters.command("backup"))
+async def cmd_backup(_, m):
+    a = arg(m).strip().lower()
+    if a not in ("on", "off"):
+        return await m.reply(
+            f"Backup: <b>{'ON' if store.data.get('backup', True) else 'OFF'}</b>\nUse: /backup on|off"
+        )
+    store.data["backup"] = a == "on"
+    await store.save()
+    await m.reply(f"✅ Backup: <b>{a.upper()}</b>")
+
+
+@app.on_message(admin & filters.command("backups"))
+async def cmd_backups(_, m):
+    counts = await store.bk_counts()
+    if not counts:
+        return await m.reply("Koi backup nahi hai (abhi restore karne layak kuch nahi).")
+    await m.reply(
+        "<b>♻️ Restore ho sakne wale posts</b>\n"
+        + "\n".join(f"• <code>{c}</code>: {n}" for c, n in counts.items())
+    )
+
+
+@app.on_message(admin & filters.command("clearbackup"))
+async def cmd_clearbackup(_, m):
+    a = arg(m).strip()
+    chat = int(a) if a.lstrip("-").isdigit() else None
+    n = await store.bk_clear(chat)
+    await m.reply(f"🗑 {n} backup delete hue." + ("" if chat else " (saare channels)"))
+
+
 @app.on_message(admin & filters.command("stop"))
 async def cmd_stop(_, m):
     if not jobs:
@@ -439,6 +696,7 @@ async def cmd_status(_, m):
         f"Channels: {len(d['channels'])}\n"
         f"Mode: {d['mode']}\n"
         f"Auto clean: {'ON' if d['autoclean'] else 'OFF'}\n"
+        f"Backup (restore ke liye): {'ON' if d.get('backup', True) else 'OFF'}\n"
         f"Running jobs: {len(jobs)}\n"
         f"Storage: {'MongoDB' if store.col is not None else 'local file (restart par reset ho sakta hai)'}"
     )
@@ -450,6 +708,7 @@ async def on_new_post(_, msg):
     if not store.data["autoclean"] or msg.chat.id not in store.data["channels"]:
         return
     await safe_process(msg)
+    store.bk_flush_safe()
 
 
 # ---------------------------------------------------------------- web server (Render)

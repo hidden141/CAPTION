@@ -24,3 +24,15 @@ Kya hatana hai wo admin bot ke andar commands se khud set karta hai.
 /clean [channel_id] [start_id] [end_id] - purane posts clean (end na do to automatic last post tak)
 /stop                - chalti cleaning rok do
 /status              - current settings
+
+## Repair / Restore (hataye hue caption wapas)
+Bot har edit se pehle post ka original caption/text save karta hai (MongoDB `backups` collection, ya local `backups.json`).
+/restore [channel_id] [start_id] [end_id] - original caption wapas lagao (channel na do to saare added channels)
+/backup on|off       - edit se pehle original save karna (default ON)
+/backups             - kitne posts restore ho sakte hain
+/clearbackup [channel_id] - backups delete (jagah bachane ke liye)
+
+Note: sirf wahi posts restore hote hain jo is update ke BAAD clean hue (backup tabhi bana).
+Pehle se clean ho chuke posts ka original bot ke paas nahi hai.
+Restore ke baad dubara /clean ya autoclean chalega to text phir hat jayega - pehle /autoclean off karo.
+Render par MONGO_URI zaroor set rakho, warna restart par local backups.json ud jaata hai.
